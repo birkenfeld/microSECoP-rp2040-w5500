@@ -20,12 +20,12 @@ use hal::{
     spi::{Enabled, Spi},
 };
 use w5500_dhcp::{
-    hl::Hostname,
+    hl::{Common, Hostname, Tcp},
     ll::{
-        eh0::{reset, vdm_infallible_gpio::W5500},
-        net::{Eui48Addr, Ipv4Addr, SocketAddrV4},
-        spi::MODE as W5500_MODE,
+        eh0::{reset, MODE as W5500_MODE, vdm_infallible_gpio::W5500},
+        net::{Eui48Addr},
         LinkStatus, OperationMode, PhyCfg, Registers, Sn,
+        SocketInterruptMask
     },
     Client as DhcpClient,
 };
@@ -57,10 +57,11 @@ const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 const SYSCLK_HZ: u32 = 125_000_000u32;
 
 const DHCP_SN: Sn = Sn::Sn0;
+const SECOP_SN: Sn = Sn::Sn1;
 
-const SERVER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 4), 1883);
-const NAME: &str = "ambient1";
+const NAME: &str = "pinode";
 const HOSTNAME: Hostname<'static> = Hostname::new_unwrapped(NAME);
+const SECOP_PORT: u16 = 10767;
 
 fn monotonic_secs() -> u32 {
     app::monotonics::now()
@@ -196,6 +197,13 @@ mod app {
         let dhcp = DhcpClient::new(DHCP_SN, seed, mac, HOSTNAME);
         dhcp.setup_socket(&mut w5500).unwrap();
 
+        let simr = w5500.simr().unwrap();
+        w5500.set_simr(simr | SECOP_SN.bitmask()).unwrap();
+        const MASK: SocketInterruptMask = SocketInterruptMask::ALL_MASKED.unmask_recv();
+        w5500.set_sn_imr(SECOP_SN, MASK).unwrap();
+        w5500.close(SECOP_SN).unwrap();
+        w5500.tcp_listen(SECOP_SN, SECOP_PORT).unwrap();
+
         // start the DHCP client
         dhcp_sn::spawn().unwrap();
 
@@ -244,9 +252,25 @@ mod app {
 
                 // spawn MQTT task if bound
                 if dhcp.has_lease() && !leased_before {
-                    info!("NOW CAN DO SOMETHING");
+                    if secop_sn::spawn().is_err() {
+                        error!("SECOP task is already spawned");
+                    }
                 }
             },
+        )
+    }
+
+    #[task(shared = [w5500])]
+    fn secop_sn(cx: secop_sn::Context) {
+        info!("[TASK] secop_sn");
+
+        (cx.shared.w5500,).lock(
+            |w5500| {
+                let mut buf = [0; 256];
+                let rx_bytes: u16 = w5500.tcp_read(SECOP_SN, &mut buf).unwrap();
+                info!("got {} bytes from secop: {}", rx_bytes, &buf[..rx_bytes as usize]);
+                w5500.tcp_write(SECOP_SN, &buf[..rx_bytes as usize]).unwrap();
+            }
         )
     }
 
@@ -266,11 +290,10 @@ mod app {
                 }
             }
         });
+
+        // secop_sn::spawn_after(1.secs()).unwrap();
     }
 
-    /// This is the W5500 interrupt.
-    ///
-    /// The only interrupts we should get are for the DHCP & MQTT sockets.
     #[task(binds = IO_IRQ_BANK0, local = [irq_pin], shared = [w5500])]
     fn irq_bank0(mut cx: irq_bank0::Context) {
         info!("[TASK] exti0");
@@ -289,6 +312,12 @@ mod app {
             if sir & DHCP_SN.bitmask() != 0 {
                 if dhcp_sn::spawn().is_err() {
                     error!("DHCP task already spawned")
+                }
+            }
+
+            if sir & SECOP_SN.bitmask() != 0 {
+                if secop_sn::spawn().is_err() {
+                    error!("SECOP task already spawned")
                 }
             }
         });
