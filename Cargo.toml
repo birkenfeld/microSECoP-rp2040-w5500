@@ -6,6 +6,7 @@ version = "0.1.0"
 [dependencies]
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
+cortex-m-rtic = "1.0"
 embedded-hal = { version = "0.2.5", features = ["unproven"] }
 
 # Versions >0.3.4 contain a breaking change (wire format 4) and version 0.3.3 is yanked,
@@ -14,16 +15,15 @@ embedded-hal = { version = "0.2.5", features = ["unproven"] }
 defmt = "=0.3.2"
 defmt-rtt = "0.4"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
+fugit = "0.3.6"
 
 # We're using a Pico by default on this template
 rp-pico = "0.7"
+pio = "0.2"
 
-# but you can use any BSP. Uncomment this to use the pro_micro_rp2040 BSP instead
-# sparkfun-pro-micro-rp2040 = "0.6"
-
-# If you're not going to use a Board Support Package you'll need these:
-# rp2040-hal = { version="0.8", features=["rt", "critical-section-impl"] }
-# rp2040-boot2 = "0.2"
+# w5500 libs
+w5500-dhcp = { path = "../ext/w5500-rs/dhcp", features = ["eh0", "defmt"] }
+systick-monotonic = "1"
 
 # cargo build/run
 [profile.dev]
