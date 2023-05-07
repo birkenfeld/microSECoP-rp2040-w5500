@@ -1,60 +1,36 @@
 //! Raspberry Pi Pico and Wiznet W5500 experiment.
+//!
+//! Mostly copied from https://github.com/newAM/ambientsensor-rs
 #![no_std]
 #![no_main]
 
-use rp_pico::hal;
-use hal::pac;
-use hal::Clock;
-use panic_probe as _;
 use defmt::*;
 use defmt_rtt as _;
-
-use fugit::RateExtU32;
-use embedded_hal::digital::v2::OutputPin;
-use systick_monotonic::{ExtU64, Systick};
+use panic_probe as _;
 
 use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
-use hal::{
-    gpio::{Interrupt, Pin, Input, Output, PullDown, PushPull, bank0},
+use embedded_hal::digital::v2::OutputPin;
+use fugit::{ExtU64, RateExtU32};
+use rp_pico::hal::{
+    self,
+    gpio::{Input, Interrupt, Output, Pin, PullDown, PushPull},
     pac::SPI1,
     spi::{Enabled, Spi},
+    Clock,
 };
+use systick_monotonic::Systick;
 use w5500_dhcp::{
     hl::{Common, Hostname, Tcp},
     ll::{
-        eh0::{reset, MODE as W5500_MODE, vdm_infallible_gpio::W5500},
-        net::{Eui48Addr},
-        LinkStatus, OperationMode, PhyCfg, Registers, Sn,
-        SocketInterruptMask
+        eh0::{reset, vdm_infallible_gpio::W5500, MODE as W5500_MODE},
+        net::Eui48Addr,
+        LinkStatus, OperationMode, PhyCfg, Registers, Sn, SocketInterruptMask,
     },
     Client as DhcpClient,
 };
 
-pub struct CycleDelay;
-
-impl Default for CycleDelay {
-    fn default() -> CycleDelay {
-        CycleDelay
-    }
-}
-
-impl embedded_hal::blocking::delay::DelayMs<u8> for CycleDelay {
-    fn delay_ms(&mut self, ms: u8) {
-        delay_ms(ms.into())
-    }
-}
-
-/// Worlds worst delay function.
-#[inline(always)]
-pub fn delay_ms(ms: u32) {
-    const CYCLES_PER_MILLIS: u32 = SYSCLK_HZ / 1000;
-    cortex_m::asm::delay(CYCLES_PER_MILLIS.saturating_mul(ms));
-}
-
-/// External high-speed crystal on the Raspberry Pi Pico board is 12 MHz. Adjust
-/// if your board has a different frequency
+/// External high-speed crystal on the Raspberry Pi Pico board is 12 MHz.
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
-const SYSCLK_HZ: u32 = 125_000_000u32;
 
 const DHCP_SN: Sn = Sn::Sn0;
 const SECOP_SN: Sn = Sn::Sn1;
@@ -72,7 +48,7 @@ fn monotonic_secs() -> u32 {
 }
 
 #[rtic::app(
-    device = crate::pac,
+    device = crate::hal::pac,
     dispatchers = [UART0_IRQ, UART1_IRQ],
 )]
 mod app {
@@ -80,21 +56,18 @@ mod app {
 
     // RTIC manual says not to use this in production.
     #[monotonic(binds = SysTick, default = true)]
-    type MyMono = Systick<10>; // 1 Hz / 1 s granularity
+    type MyMono = Systick<10>; // 10 Hz / 0.1 s granularity
 
     #[shared]
     struct Shared {
-        w5500: W5500<
-            Spi<Enabled, SPI1, 8>,
-            Pin<bank0::Gpio13, Output<PushPull>>,
-        >,
+        w5500: W5500<Spi<Enabled, SPI1, 8>, Pin<hal::gpio::bank0::Gpio13, Output<PushPull>>>,
         dhcp: DhcpClient<'static>,
         dhcp_spawn_at: Option<u32>,
     }
 
     #[local]
     struct Local {
-        irq_pin: Pin<bank0::Gpio14, Input<PullDown>>,
+        irq_pin: Pin<hal::gpio::bank0::Gpio14, Input<PullDown>>,
     }
 
     #[init]
@@ -110,19 +83,16 @@ mod app {
             dp.PLL_USB,
             &mut dp.RESETS,
             &mut watchdog,
-        ).ok().unwrap();
+        )
+        .ok()
+        .unwrap();
 
         // Setup the pins.
         let sio = hal::sio::Sio::new(dp.SIO);
-        let pins = hal::gpio::Pins::new(
-            dp.IO_BANK0,
-            dp.PADS_BANK0,
-            sio.gpio_bank0,
-            &mut dp.RESETS,
-        );
+        let pins = hal::gpio::Pins::new(dp.IO_BANK0, dp.PADS_BANK0, sio.gpio_bank0, &mut dp.RESETS);
 
         let systick = cx.core.SYST;
-        let mono = Systick::new(systick, SYSCLK_HZ);
+        let mut delay = cortex_m::delay::Delay::new(systick, clocks.system_clock.freq().to_Hz());
 
         let w5500_cs = pins.gpio13.into_push_pull_output();
         let mut w5500_rst = pins.gpio15.into_push_pull_output();
@@ -146,7 +116,7 @@ mod app {
 
         let mac = Eui48Addr::new(0x46, 0x52, 0x4d, 0x01, 0x02, 0x03);
 
-        reset(&mut w5500_rst, &mut CycleDelay::default()).unwrap();
+        reset(&mut w5500_rst, &mut delay).unwrap();
 
         // continually initialize the W5500 until we link up
         let _phy_cfg: PhyCfg = 'outer: loop {
@@ -177,14 +147,14 @@ mod app {
                     );
                     break;
                 }
-                delay_ms(LINK_UP_POLL_PERIOD_MILLIS);
+                delay.delay_ms(LINK_UP_POLL_PERIOD_MILLIS);
                 attempts += 1;
             }
 
             w5500_rst.set_low().unwrap();
-            delay_ms(1);
+            delay.delay_ms(1);
             w5500_rst.set_high().unwrap();
-            delay_ms(3);
+            delay.delay_ms(3);
         };
         info!("Done link up");
 
@@ -192,7 +162,7 @@ mod app {
             | u64::from(cortex_m::peripheral::SYST::get_current());
 
         // additional delay seems to be required until DHCP request can be sent
-        delay_ms(500);
+        delay.delay_ms(500);
 
         let dhcp = DhcpClient::new(DHCP_SN, seed, mac, HOSTNAME);
         dhcp.setup_socket(&mut w5500).unwrap();
@@ -209,6 +179,9 @@ mod app {
 
         // start the timeout tracker
         timeout_tracker::spawn().unwrap();
+
+        // use systick for monotonic clock now
+        let mono = Systick::new(delay.free(), clocks.system_clock.freq().to_Hz());
 
         (
             Shared {
