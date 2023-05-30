@@ -112,7 +112,7 @@ mod app {
 
         let mut w5500 = W5500::new(spi1, w5500_cs);
 
-        info!("Hello world!");
+        info!("Initialized");
 
         let mac = Eui48Addr::new(0x46, 0x52, 0x4d, 0x01, 0x02, 0x03);
 
@@ -169,13 +169,14 @@ mod app {
 
         let simr = w5500.simr().unwrap();
         w5500.set_simr(simr | SECOP_SN.bitmask()).unwrap();
-        const MASK: SocketInterruptMask = SocketInterruptMask::ALL_MASKED.unmask_recv();
-        w5500.set_sn_imr(SECOP_SN, MASK).unwrap();
+        const MASK: SocketInterruptMask = SocketInterruptMask::ALL_MASKED
+            .unmask_recv().unmask_con().unmask_discon();
         w5500.close(SECOP_SN).unwrap();
+        w5500.set_sn_imr(SECOP_SN, MASK).unwrap();
         w5500.tcp_listen(SECOP_SN, SECOP_PORT).unwrap();
 
         // start the DHCP client
-        dhcp_sn::spawn().unwrap();
+        dhcp_task::spawn().unwrap();
 
         // start the timeout tracker
         timeout_tracker::spawn().unwrap();
@@ -196,80 +197,15 @@ mod app {
 
     #[idle]
     fn idle(_: idle::Context) -> ! {
-        info!("[TASK] idle");
         loop {
             compiler_fence(SeqCst);
         }
     }
 
-    #[task(shared = [w5500, dhcp, dhcp_spawn_at])]
-    fn dhcp_sn(cx: dhcp_sn::Context) {
-        info!("[TASK] dhcp_sn");
-
-        (cx.shared.w5500, cx.shared.dhcp, cx.shared.dhcp_spawn_at).lock(
-            |w5500, dhcp, dhcp_spawn_at| {
-                let leased_before: bool = dhcp.has_lease();
-                let now: u32 = monotonic_secs();
-                let spawn_after_secs: u32 = match dhcp.process(w5500, now) {
-                    Ok(sec) => sec,
-                    Err(e) => {
-                        error!("[DHCP] error {}", e);
-                        5
-                    }
-                };
-
-                let spawn_at: u32 = now + spawn_after_secs;
-                *dhcp_spawn_at = Some(spawn_at);
-                info!("[DHCP] spawning after {} seconds, at {}",
-                      spawn_after_secs, spawn_at);
-
-                // spawn MQTT task if bound
-                if dhcp.has_lease() && !leased_before {
-                    if secop_sn::spawn().is_err() {
-                        error!("SECOP task is already spawned");
-                    }
-                }
-            },
-        )
-    }
-
-    #[task(shared = [w5500])]
-    fn secop_sn(cx: secop_sn::Context) {
-        info!("[TASK] secop_sn");
-
-        (cx.shared.w5500,).lock(
-            |w5500| {
-                let mut buf = [0; 256];
-                let rx_bytes: u16 = w5500.tcp_read(SECOP_SN, &mut buf).unwrap();
-                info!("got {} bytes from secop: {}", rx_bytes, &buf[..rx_bytes as usize]);
-                w5500.tcp_write(SECOP_SN, &buf[..rx_bytes as usize]).unwrap();
-            }
-        )
-    }
-
-    #[task(shared = [dhcp_spawn_at])]
-    fn timeout_tracker(mut cx: timeout_tracker::Context) {
-        timeout_tracker::spawn_after(1.secs()).unwrap();
-
-        let now: u32 = monotonic_secs();
-
-        cx.shared.dhcp_spawn_at.lock(|dhcp_spawn_at| {
-            if let Some(then) = dhcp_spawn_at {
-                if now >= *then {
-                    if dhcp_sn::spawn().is_err() {
-                        error!("DHCP task is already spawned")
-                    }
-                    *dhcp_spawn_at = None;
-                }
-            }
-        });
-
-        // secop_sn::spawn_after(1.secs()).unwrap();
-    }
-
+    /// IRQ handler for the W5500, dispatching tasks by socket
     #[task(binds = IO_IRQ_BANK0, local = [irq_pin], shared = [w5500])]
     fn irq_bank0(mut cx: irq_bank0::Context) {
-        info!("[TASK] exti0");
+        debug!("[W5500] got interrupt");
 
         cx.shared.w5500.lock(|w5500| {
             let sir: u8 = w5500.sir().unwrap();
@@ -283,16 +219,74 @@ mod app {
             }
 
             if sir & DHCP_SN.bitmask() != 0 {
-                if dhcp_sn::spawn().is_err() {
+                if dhcp_task::spawn().is_err() {
                     error!("DHCP task already spawned")
                 }
             }
 
             if sir & SECOP_SN.bitmask() != 0 {
-                if secop_sn::spawn().is_err() {
+                if secop_task::spawn().is_err() {
                     error!("SECOP task already spawned")
                 }
             }
         });
+    }
+
+    /// Task to spawn DHCP actions when necessary
+    #[task(shared = [dhcp_spawn_at])]
+    fn timeout_tracker(mut cx: timeout_tracker::Context) {
+        timeout_tracker::spawn_after(1.secs()).unwrap();
+
+        let now: u32 = monotonic_secs();
+
+        cx.shared.dhcp_spawn_at.lock(|dhcp_spawn_at| {
+            if let Some(then) = dhcp_spawn_at {
+                if now >= *then {
+                    if dhcp_task::spawn().is_err() {
+                        error!("DHCP task already spawned")
+                    }
+                    *dhcp_spawn_at = None;
+                }
+            }
+        });
+
+        secop_task::spawn().ok();
+    }
+
+    /// DHCP client task
+    #[task(shared = [w5500, dhcp, dhcp_spawn_at])]
+    fn dhcp_task(cx: dhcp_task::Context) {
+        (cx.shared.w5500, cx.shared.dhcp, cx.shared.dhcp_spawn_at).lock(
+            |w5500, dhcp, dhcp_spawn_at| {
+                let now = monotonic_secs();
+                let spawn_after_secs = match dhcp.process(w5500, now) {
+                    Ok(sec) => sec,
+                    Err(e) => {
+                        error!("[DHCP] error {}", e);
+                        5
+                    }
+                };
+
+                let spawn_at = now + spawn_after_secs;
+                *dhcp_spawn_at = Some(spawn_at);
+                info!("[DHCP] spawning after {} seconds, at {}",
+                      spawn_after_secs, spawn_at);
+            },
+        )
+    }
+
+    /// SECoP server task
+    #[task(shared = [w5500])]
+    fn secop_task(cx: secop_task::Context) {
+        (cx.shared.w5500,).lock(
+            |w5500| {
+                let mut buf = [0; 256];
+                let rx_bytes: u16 = w5500.tcp_read(SECOP_SN, &mut buf).unwrap();
+                if rx_bytes > 0 {
+                    info!("got {} bytes from secop: {}", rx_bytes, &buf[..rx_bytes as usize]);
+                    w5500.tcp_write(SECOP_SN, &buf[..rx_bytes as usize]).unwrap();
+                }
+            }
+        )
     }
 }
