@@ -4,6 +4,8 @@
 #![no_std]
 #![no_main]
 
+pub mod proto;
+
 use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
@@ -74,6 +76,7 @@ mod app {
     #[local]
     struct Local {
         irq_pin: Pin<Gpio14, FunctionSio<SioInput>, PullDown>,
+        node: proto::SecNode,
     }
 
     #[init]
@@ -197,7 +200,10 @@ mod app {
                 dhcp,
                 dhcp_spawn_at: None,
             },
-            Local { irq_pin: w5500_int },
+            Local {
+                irq_pin: w5500_int,
+                node: proto::SecNode::new(),
+            },
             init::Monotonics(mono),
         )
     }
@@ -236,7 +242,13 @@ mod app {
             if sir & SECOP_SN.bitmask() != 0 {
                 let sn_ir = w5500.sn_ir(SECOP_SN).unwrap();
                 let _ = w5500.set_sn_ir(SECOP_SN, sn_ir);
-                if secop_task::spawn().is_err() {
+
+                if sn_ir.discon_raised() {
+                    info!("[SECoP] client disconnected");
+                    w5500.tcp_listen(SECOP_SN, SECOP_PORT).unwrap();
+                } else if sn_ir.con_raised() {
+                    info!("[SECoP] client connected");
+                } else if secop_task::spawn().is_err() {
                     error!("SECOP task already spawned")
                 }
             }
@@ -285,26 +297,24 @@ mod app {
     }
 
     /// SECoP server task
-    #[task(shared = [w5500])]
+    #[task(shared = [w5500], local = [node])]
     fn secop_task(cx: secop_task::Context) {
-        info!("[SECoP] task");
         (cx.shared.w5500,).lock(
             |w5500| {
-                let mut n = 0;
-                let mut buf = [0; 256];
+                let mut msg_len = 0;
+                let mut buf = [0; 1024];
                 if let Ok(mut reader) = w5500.tcp_reader(SECOP_SN) {
-                    if let Ok(nr) = reader.read(&mut buf) {
-                        n = nr;
-                        info!("[SECoP] got {} bytes: {}", n, &buf[..n as usize]);
-                    }
+                    msg_len = reader.read(&mut buf).unwrap_or(0) as usize;
                     reader.done().unwrap();
                 }
-                let mut w = w5500.tcp_writer(SECOP_SN).unwrap();
-                w.write(&buf[..n as usize]).unwrap();
-                w.send().unwrap();
-                // let rx_bytes: u16 = w5500.tcp_read(SECOP_SN, &mut buf).unwrap();
-                // if rx_bytes > 0 {
-                // }
+                if msg_len == 0 {
+                    return;
+                }
+                info!("[SECoP] incoming: {:?}", core::str::from_utf8(&buf[..msg_len]).map_err(|_| ()));
+                if let Ok(mut writer) = w5500.tcp_writer(SECOP_SN) {
+                    cx.local.node.process(&buf[..msg_len], &mut writer);
+                    writer.send().unwrap();
+                }
             }
         )
     }

@@ -16,7 +16,7 @@ rp-pico = "0.8"
 pio = "0.2"
 
 # w5500 libs
-w5500-dhcp = { path = "../ext/w5500-rs/dhcp", features = ["eh0", "defmt"] }
+w5500-dhcp = { version = "0.6", features = ["eh0", "defmt"] }
 systick-monotonic = "1"
 
 # cargo build/run
