@@ -13,14 +13,15 @@ use embedded_hal::digital::v2::OutputPin;
 use fugit::{ExtU64, RateExtU32};
 use rp_pico::hal::{
     self,
-    gpio::{Input, Interrupt, Output, Pin, PullDown, PushPull},
+    gpio::{bank0::*, FunctionSio, FunctionSpi, Interrupt, Pin, PullDown,
+           SioOutput, SioInput},
     pac::SPI1,
     spi::{Enabled, Spi},
     Clock,
 };
 use systick_monotonic::Systick;
 use w5500_dhcp::{
-    hl::{Common, Hostname, Tcp},
+    hl::{Common, Hostname, Tcp, io::Read, io::Write},
     ll::{
         eh0::{reset, vdm_infallible_gpio::W5500, MODE as W5500_MODE},
         net::Eui48Addr,
@@ -47,6 +48,11 @@ fn monotonic_secs() -> u32 {
         .unwrap()
 }
 
+type MyW5500 = W5500<Spi<Enabled, SPI1, (Pin<Gpio11, FunctionSpi, PullDown>,
+                                         Pin<Gpio12, FunctionSpi, PullDown>,
+                                         Pin<Gpio10, FunctionSpi, PullDown>), 8>,
+                     Pin<Gpio13, FunctionSio<SioOutput>, PullDown>>;
+
 #[rtic::app(
     device = crate::hal::pac,
     dispatchers = [UART0_IRQ, UART1_IRQ],
@@ -60,14 +66,14 @@ mod app {
 
     #[shared]
     struct Shared {
-        w5500: W5500<Spi<Enabled, SPI1, 8>, Pin<hal::gpio::bank0::Gpio13, Output<PushPull>>>,
+        w5500: MyW5500,
         dhcp: DhcpClient<'static>,
         dhcp_spawn_at: Option<u32>,
     }
 
     #[local]
     struct Local {
-        irq_pin: Pin<hal::gpio::bank0::Gpio14, Input<PullDown>>,
+        irq_pin: Pin<Gpio14, FunctionSio<SioInput>, PullDown>,
     }
 
     #[init]
@@ -94,23 +100,24 @@ mod app {
         let systick = cx.core.SYST;
         let mut delay = cortex_m::delay::Delay::new(systick, clocks.system_clock.freq().to_Hz());
 
-        let w5500_cs = pins.gpio13.into_push_pull_output();
+        let mut w5500 = {
+            let cs = pins.gpio13.into_push_pull_output();
+            let mosi = pins.gpio11.into_function::<hal::gpio::FunctionSpi>();
+            let miso = pins.gpio12.into_function::<hal::gpio::FunctionSpi>();
+            let sclk = pins.gpio10.into_function::<hal::gpio::FunctionSpi>();
+            let spi1 = hal::spi::Spi::<_, _, _, 8>::new(dp.SPI1, (mosi, miso, sclk));
+            let spi1 = spi1.init(
+                &mut dp.RESETS,
+                clocks.peripheral_clock.freq(),
+                1_000_000u32.Hz(),
+                &W5500_MODE,
+            );
+            W5500::new(spi1, cs)
+        };
+
         let mut w5500_rst = pins.gpio15.into_push_pull_output();
         let w5500_int = pins.gpio14.into_pull_down_input();
         w5500_int.set_interrupt_enabled(Interrupt::EdgeLow, true);
-
-        let _spi_sclk = pins.gpio10.into_mode::<hal::gpio::FunctionSpi>();
-        let _spi_mosi = pins.gpio11.into_mode::<hal::gpio::FunctionSpi>();
-        let _spi_miso = pins.gpio12.into_mode::<hal::gpio::FunctionSpi>();
-        let spi1 = hal::spi::Spi::<_, _, 8>::new(dp.SPI1);
-        let spi1 = spi1.init(
-            &mut dp.RESETS,
-            clocks.peripheral_clock.freq(),
-            1_000_000u32.Hz(),
-            &W5500_MODE,
-        );
-
-        let mut w5500 = W5500::new(spi1, w5500_cs);
 
         info!("Initialized");
 
@@ -219,12 +226,16 @@ mod app {
             }
 
             if sir & DHCP_SN.bitmask() != 0 {
+                let sn_ir = w5500.sn_ir(DHCP_SN).unwrap();
+                let _ = w5500.set_sn_ir(DHCP_SN, sn_ir);
                 if dhcp_task::spawn().is_err() {
                     error!("DHCP task already spawned")
                 }
             }
 
             if sir & SECOP_SN.bitmask() != 0 {
+                let sn_ir = w5500.sn_ir(SECOP_SN).unwrap();
+                let _ = w5500.set_sn_ir(SECOP_SN, sn_ir);
                 if secop_task::spawn().is_err() {
                     error!("SECOP task already spawned")
                 }
@@ -249,8 +260,6 @@ mod app {
                 }
             }
         });
-
-        secop_task::spawn().ok();
     }
 
     /// DHCP client task
@@ -278,14 +287,24 @@ mod app {
     /// SECoP server task
     #[task(shared = [w5500])]
     fn secop_task(cx: secop_task::Context) {
+        info!("[SECoP] task");
         (cx.shared.w5500,).lock(
             |w5500| {
+                let mut n = 0;
                 let mut buf = [0; 256];
-                let rx_bytes: u16 = w5500.tcp_read(SECOP_SN, &mut buf).unwrap();
-                if rx_bytes > 0 {
-                    info!("got {} bytes from secop: {}", rx_bytes, &buf[..rx_bytes as usize]);
-                    w5500.tcp_write(SECOP_SN, &buf[..rx_bytes as usize]).unwrap();
+                if let Ok(mut reader) = w5500.tcp_reader(SECOP_SN) {
+                    if let Ok(nr) = reader.read(&mut buf) {
+                        n = nr;
+                        info!("[SECoP] got {} bytes: {}", n, &buf[..n as usize]);
+                    }
+                    reader.done().unwrap();
                 }
+                let mut w = w5500.tcp_writer(SECOP_SN).unwrap();
+                w.write(&buf[..n as usize]).unwrap();
+                w.send().unwrap();
+                // let rx_bytes: u16 = w5500.tcp_read(SECOP_SN, &mut buf).unwrap();
+                // if rx_bytes > 0 {
+                // }
             }
         )
     }
