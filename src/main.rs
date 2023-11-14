@@ -15,6 +15,7 @@ use embedded_hal::digital::v2::OutputPin;
 use fugit::{ExtU64, RateExtU32};
 use rp_pico::hal::{
     self,
+    adc::Adc,
     gpio::{bank0::*, FunctionSio, FunctionSpi, Interrupt, Pin, PullDown,
            SioOutput, SioInput},
     pac::SPI1,
@@ -36,7 +37,7 @@ use w5500_dhcp::{
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
 const DHCP_SN: Sn = Sn::Sn0;
-const SECOP_SN: Sn = Sn::Sn1;
+const SECOP_SNs: [Sn; 5] = [Sn::Sn1, Sn::Sn2, Sn::Sn3, Sn::Sn4, Sn::Sn5];
 
 const NAME: &str = "pinode";
 const HOSTNAME: Hostname<'static> = Hostname::new_unwrapped(NAME);
@@ -69,6 +70,7 @@ mod app {
     #[shared]
     struct Shared {
         w5500: MyW5500,
+        node: proto::SecNode,
         dhcp: DhcpClient<'static>,
         dhcp_spawn_at: Option<u32>,
     }
@@ -76,7 +78,6 @@ mod app {
     #[local]
     struct Local {
         irq_pin: Pin<Gpio14, FunctionSio<SioInput>, PullDown>,
-        node: proto::SecNode,
     }
 
     #[init]
@@ -177,13 +178,15 @@ mod app {
         let dhcp = DhcpClient::new(DHCP_SN, seed, mac, HOSTNAME);
         dhcp.setup_socket(&mut w5500).unwrap();
 
-        let simr = w5500.simr().unwrap();
-        w5500.set_simr(simr | SECOP_SN.bitmask()).unwrap();
-        const MASK: SocketInterruptMask = SocketInterruptMask::ALL_MASKED
-            .unmask_recv().unmask_con().unmask_discon();
-        w5500.close(SECOP_SN).unwrap();
-        w5500.set_sn_imr(SECOP_SN, MASK).unwrap();
-        w5500.tcp_listen(SECOP_SN, SECOP_PORT).unwrap();
+        for sn in SECOP_SNs {
+            let simr = w5500.simr().unwrap();
+            w5500.set_simr(simr | sn.bitmask()).unwrap();
+            const MASK: SocketInterruptMask = SocketInterruptMask::ALL_MASKED
+                .unmask_recv().unmask_con().unmask_discon();
+            w5500.close(sn).unwrap();
+            w5500.set_sn_imr(sn, MASK).unwrap();
+            w5500.tcp_listen(sn, SECOP_PORT).unwrap();
+        }
 
         // start the DHCP client
         dhcp_task::spawn().unwrap();
@@ -191,18 +194,27 @@ mod app {
         // start the timeout tracker
         timeout_tracker::spawn().unwrap();
 
+        // start the SECoP polling task
+        for sn in SECOP_SNs {
+            secop_poll::spawn_after(500.millis(), sn).unwrap();
+        }
+
         // use systick for monotonic clock now
         let mono = Systick::new(delay.free(), clocks.system_clock.freq().to_Hz());
+
+        let mut adc = Adc::new(dp.ADC, &mut dp.RESETS);
+        let sensor = adc.take_temp_sensor().unwrap();
+        let node = proto::SecNode::new(adc, sensor);
 
         (
             Shared {
                 w5500,
+                node,
                 dhcp,
                 dhcp_spawn_at: None,
             },
             Local {
                 irq_pin: w5500_int,
-                node: proto::SecNode::new(),
             },
             init::Monotonics(mono),
         )
@@ -239,17 +251,19 @@ mod app {
                 }
             }
 
-            if sir & SECOP_SN.bitmask() != 0 {
-                let sn_ir = w5500.sn_ir(SECOP_SN).unwrap();
-                let _ = w5500.set_sn_ir(SECOP_SN, sn_ir);
+            for sn in SECOP_SNs {
+                if sir & sn.bitmask() != 0 {
+                    let sn_ir = w5500.sn_ir(sn).unwrap();
+                    let _ = w5500.set_sn_ir(sn, sn_ir);
 
-                if sn_ir.discon_raised() {
-                    info!("[SECoP] client disconnected");
-                    w5500.tcp_listen(SECOP_SN, SECOP_PORT).unwrap();
-                } else if sn_ir.con_raised() {
-                    info!("[SECoP] client connected");
-                } else if secop_task::spawn().is_err() {
-                    error!("SECOP task already spawned")
+                    if sn_ir.discon_raised() {
+                        info!("[SECoP] client disconnected");
+                        w5500.tcp_listen(sn, SECOP_PORT).unwrap();
+                    } else if sn_ir.con_raised() {
+                        info!("[SECoP] client connected");
+                    } else if secop_request::spawn(sn).is_err() {
+                        error!("SECOP task already spawned")
+                    }
                 }
             }
         });
@@ -296,26 +310,42 @@ mod app {
         )
     }
 
-    /// SECoP server task
-    #[task(shared = [w5500], local = [node])]
-    fn secop_task(cx: secop_task::Context) {
-        (cx.shared.w5500,).lock(
-            |w5500| {
-                let mut msg_len = 0;
-                let mut buf = [0; 1024];
-                if let Ok(mut reader) = w5500.tcp_reader(SECOP_SN) {
-                    msg_len = reader.read(&mut buf).unwrap_or(0) as usize;
-                    reader.done().unwrap();
-                }
-                if msg_len == 0 {
-                    return;
-                }
-                info!("[SECoP] incoming: {:?}", core::str::from_utf8(&buf[..msg_len]).map_err(|_| ()));
-                if let Ok(mut writer) = w5500.tcp_writer(SECOP_SN) {
-                    cx.local.node.process(&buf[..msg_len], &mut writer);
+    /// SECoP request server task
+    #[task(shared = [w5500, node], capacity = 5)]
+    fn secop_request(mut cx: secop_request::Context, sn: Sn) {
+        cx.shared.w5500.lock(|w5500| {
+            let mut msg_len = 0;
+            let mut buf = [0; 1024];
+            if let Ok(mut reader) = w5500.tcp_reader(sn) {
+                msg_len = reader.read(&mut buf).unwrap_or(0) as usize;
+                reader.done().unwrap();
+            } else {
+                error!("[SECoP] failed to get reader");
+            }
+            if msg_len == 0 {
+                return;
+            }
+            info!("[SECoP] incoming: {:?}", core::str::from_utf8(&buf[..msg_len]).map_err(|_| ()));
+            if let Ok(mut writer) = w5500.tcp_writer(sn) {
+                cx.shared.node.lock(|node| node.process(&buf[..msg_len], &mut writer));
+                writer.send().unwrap();
+            } else {
+                error!("[SECoP] failed to get writer");
+            }
+        })
+    }
+
+    /// SECoP regular polling task
+    #[task(shared = [w5500, node], capacity = 5)]
+    fn secop_poll(cx: secop_poll::Context, sn: Sn) {
+        (cx.shared.w5500, cx.shared.node).lock(
+            |w5500, node| {
+                if let Ok(mut writer) = w5500.tcp_writer(sn) {
+                    node.poll(&mut writer);
                     writer.send().unwrap();
                 }
             }
-        )
+        );
+        secop_poll::spawn_after(500.millis(), sn).unwrap();
     }
 }
