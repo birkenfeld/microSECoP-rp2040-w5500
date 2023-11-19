@@ -1,15 +1,15 @@
 //! Raspberry Pi Pico and Wiznet W5500 experiment.
 //!
-//! Mostly copied from https://github.com/newAM/ambientsensor-rs
+//! Initially adapted from https://github.com/newAM/ambientsensor-rs
 #![no_std]
 #![no_main]
-
-pub mod proto;
 
 use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
 
+use core::fmt;
+use core::marker::PhantomData;
 use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
 use embedded_hal::digital::v2::OutputPin;
 use fugit::{ExtU64, RateExtU32};
@@ -24,24 +24,38 @@ use rp_pico::hal::{
 };
 use systick_monotonic::Systick;
 use w5500_dhcp::{
-    hl::{Common, Hostname, Tcp, io::Read, io::Write},
+    hl::{Hostname, Tcp, Udp, io::Read, io::Write},
     ll::{
         eh0::{reset, vdm_infallible_gpio::W5500, MODE as W5500_MODE},
-        net::Eui48Addr,
-        LinkStatus, OperationMode, PhyCfg, Registers, Sn, SocketInterruptMask,
+        net::Eui48Addr, net::SocketAddrV4,
+        LinkStatus, OperationMode, PhyCfg, Registers, Sn, SOCKETS, SocketInterruptMask,
     },
     Client as DhcpClient,
 };
+use usecop::proto::Timestamp;
+
+mod node;
 
 /// External high-speed crystal on the Raspberry Pi Pico board is 12 MHz.
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
-const DHCP_SN: Sn = Sn::Sn0;
-const SECOP_SNs: [Sn; 5] = [Sn::Sn1, Sn::Sn2, Sn::Sn3, Sn::Sn4, Sn::Sn5];
+const SECOP_SN: [Sn; 6] = [Sn::Sn0, Sn::Sn1, Sn::Sn2, Sn::Sn3, Sn::Sn4, Sn::Sn5];
+const DHCP_SN: Sn = Sn::Sn6;
+const NTP_SN: Sn = Sn::Sn7;
+const IRQ_MASK: SocketInterruptMask = SocketInterruptMask::ALL_MASKED
+    .unmask_recv().unmask_con().unmask_discon();
 
 const NAME: &str = "pinode";
 const HOSTNAME: Hostname<'static> = Hostname::new_unwrapped(NAME);
 const SECOP_PORT: u16 = 10767;
+const TIME_GRANULARITY: u32 = 10;  // 10 Hz / 0.1 s granularity
+
+const NTP_PORT: u16 = 123;
+// Simple packet requesting current timestamp
+const NTP_REQUEST: &[u8] = b"\xE3\x00\x06\xEC\x00\x00\x00\x00\x00\x00\x00\x00\
+                             \x31\x4E\x31\x34\x00\x00\x00\x00\x00\x00\x00\x00\
+                             \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+                             \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 
 fn monotonic_secs() -> u32 {
     app::monotonics::now()
@@ -63,16 +77,16 @@ type MyW5500 = W5500<Spi<Enabled, SPI1, (Pin<Gpio11, FunctionSpi, PullDown>,
 mod app {
     use super::*;
 
-    // RTIC manual says not to use this in production.
     #[monotonic(binds = SysTick, default = true)]
-    type MyMono = Systick<10>; // 10 Hz / 0.1 s granularity
+    type Time = Systick<TIME_GRANULARITY>;
 
     #[shared]
     struct Shared {
         w5500: MyW5500,
-        node: proto::SecNode,
+        node: node::SecNode,
         dhcp: DhcpClient<'static>,
         dhcp_spawn_at: Option<u32>,
+        ntp_time: Option<f64>,
     }
 
     #[local]
@@ -130,7 +144,7 @@ mod app {
         reset(&mut w5500_rst, &mut delay).unwrap();
 
         // continually initialize the W5500 until we link up
-        let _phy_cfg: PhyCfg = 'outer: loop {
+        'outer: loop {
             // sanity check W5500 communications
             core::assert_eq!(w5500.version().unwrap(), w5500_dhcp::ll::VERSION);
 
@@ -149,7 +163,7 @@ mod app {
             loop {
                 let phy_cfg: PhyCfg = w5500.phycfgr().unwrap();
                 if phy_cfg.lnk() == LinkStatus::Up {
-                    break 'outer phy_cfg;
+                    break 'outer;
                 }
                 if attempts >= LINK_UP_POLL_ATTEMPTS {
                     info!(
@@ -166,7 +180,7 @@ mod app {
             delay.delay_ms(1);
             w5500_rst.set_high().unwrap();
             delay.delay_ms(3);
-        };
+        }
         info!("Done link up");
 
         let seed: u64 = u64::from(cortex_m::peripheral::SYST::get_current()) << 32
@@ -178,33 +192,35 @@ mod app {
         let dhcp = DhcpClient::new(DHCP_SN, seed, mac, HOSTNAME);
         dhcp.setup_socket(&mut w5500).unwrap();
 
-        for sn in SECOP_SNs {
-            let simr = w5500.simr().unwrap();
-            w5500.set_simr(simr | sn.bitmask()).unwrap();
-            const MASK: SocketInterruptMask = SocketInterruptMask::ALL_MASKED
-                .unmask_recv().unmask_con().unmask_discon();
-            w5500.close(sn).unwrap();
-            w5500.set_sn_imr(sn, MASK).unwrap();
+        let mut simr = w5500.simr().unwrap();
+        simr |= NTP_SN.bitmask();
+        w5500.set_sn_imr(NTP_SN, IRQ_MASK).unwrap();
+        w5500.udp_bind(NTP_SN, 12345).unwrap();
+
+        for sn in SECOP_SN {
+            simr |= sn.bitmask();
+            w5500.set_sn_imr(sn, IRQ_MASK).unwrap();
+            // yes, all sockets can listen on the same port :)
             w5500.tcp_listen(sn, SECOP_PORT).unwrap();
         }
 
+        w5500.set_simr(simr).unwrap();
+
         // start the DHCP client
-        dhcp_task::spawn().unwrap();
+        dhcp_client::spawn().unwrap();
 
         // start the timeout tracker
         timeout_tracker::spawn().unwrap();
 
         // start the SECoP polling task
-        for sn in SECOP_SNs {
-            secop_poll::spawn_after(500.millis(), sn).unwrap();
-        }
+        secop_poll::spawn_after(500.millis()).unwrap();
 
         // use systick for monotonic clock now
         let mono = Systick::new(delay.free(), clocks.system_clock.freq().to_Hz());
 
         let mut adc = Adc::new(dp.ADC, &mut dp.RESETS);
         let sensor = adc.take_temp_sensor().unwrap();
-        let node = proto::SecNode::new(adc, sensor);
+        let node = node::create(adc, sensor);
 
         (
             Shared {
@@ -212,6 +228,7 @@ mod app {
                 node,
                 dhcp,
                 dhcp_spawn_at: None,
+                ntp_time: None,
             },
             Local {
                 irq_pin: w5500_int,
@@ -228,7 +245,7 @@ mod app {
     }
 
     /// IRQ handler for the W5500, dispatching tasks by socket
-    #[task(binds = IO_IRQ_BANK0, local = [irq_pin], shared = [w5500])]
+    #[task(binds = IO_IRQ_BANK0, local = [irq_pin], shared = [w5500, node])]
     fn irq_bank0(mut cx: irq_bank0::Context) {
         debug!("[W5500] got interrupt");
 
@@ -246,23 +263,36 @@ mod app {
             if sir & DHCP_SN.bitmask() != 0 {
                 let sn_ir = w5500.sn_ir(DHCP_SN).unwrap();
                 let _ = w5500.set_sn_ir(DHCP_SN, sn_ir);
-                if dhcp_task::spawn().is_err() {
+                if dhcp_client::spawn().is_err() {
                     error!("DHCP task already spawned")
                 }
             }
 
-            for sn in SECOP_SNs {
+            if sir & NTP_SN.bitmask() != 0 {
+                let sn_ir = w5500.sn_ir(NTP_SN).unwrap();
+                let _ = w5500.set_sn_ir(NTP_SN, sn_ir);
+                if ntp_client::spawn().is_err() {
+                    error!("NTP task already spawned")
+                }
+            }
+
+            for sn in SECOP_SN {
                 if sir & sn.bitmask() != 0 {
                     let sn_ir = w5500.sn_ir(sn).unwrap();
                     let _ = w5500.set_sn_ir(sn, sn_ir);
 
                     if sn_ir.discon_raised() {
                         info!("[SECoP] client disconnected");
+                        cx.shared.node.lock(|node| node.client_finished(sn as usize));
                         w5500.tcp_listen(sn, SECOP_PORT).unwrap();
                     } else if sn_ir.con_raised() {
                         info!("[SECoP] client connected");
-                    } else if secop_request::spawn(sn).is_err() {
-                        error!("SECOP task already spawned")
+                        cx.shared.node.lock(|node| node.client_connected(sn as usize));
+                    }
+                    if sn_ir.recv_raised() {
+                        if secop_request::spawn(sn).is_err() {
+                            error!("SECoP task already spawned")
+                        }
                     }
                 }
             }
@@ -279,7 +309,7 @@ mod app {
         cx.shared.dhcp_spawn_at.lock(|dhcp_spawn_at| {
             if let Some(then) = dhcp_spawn_at {
                 if now >= *then {
-                    if dhcp_task::spawn().is_err() {
+                    if dhcp_client::spawn().is_err() {
                         error!("DHCP task already spawned")
                     }
                     *dhcp_spawn_at = None;
@@ -290,7 +320,7 @@ mod app {
 
     /// DHCP client task
     #[task(shared = [w5500, dhcp, dhcp_spawn_at])]
-    fn dhcp_task(cx: dhcp_task::Context) {
+    fn dhcp_client(cx: dhcp_client::Context) {
         (cx.shared.w5500, cx.shared.dhcp, cx.shared.dhcp_spawn_at).lock(
             |w5500, dhcp, dhcp_spawn_at| {
                 let now = monotonic_secs();
@@ -302,6 +332,12 @@ mod app {
                     }
                 };
 
+                if let Some(ip) = dhcp.ntp() {
+                    info!("[NTP] requesting time from {}", ip);
+                    let addr = SocketAddrV4::new(ip, NTP_PORT);
+                    w5500.udp_send_to(NTP_SN, NTP_REQUEST, &addr).unwrap();
+                }
+
                 let spawn_at = now + spawn_after_secs;
                 *dhcp_spawn_at = Some(spawn_at);
                 info!("[DHCP] spawning after {} seconds, at {}",
@@ -310,9 +346,35 @@ mod app {
         )
     }
 
+    /// NTP client task for getting absolute time
+    #[task(shared = [w5500, ntp_time])]
+    fn ntp_client(cx: ntp_client::Context) {
+        let now = monotonics::Time::now().ticks() as f64 / TIME_GRANULARITY as f64;
+        let mut buf = [0; 44];  // we need bytes 40-44 only
+        (cx.shared.w5500, cx.shared.ntp_time).lock(|w5500, time| {
+            w5500.udp_recv_from(NTP_SN, &mut buf).unwrap();
+            let stamp = u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]);
+            // conversion to Unix time, differs by seventy years
+            let stamp = stamp - 2208988800;
+            defmt::info!("[NTP] got timestamp {}", stamp);
+            *time = Some(stamp as f64 - now);
+        });
+    }
+
+    fn get_time(mut epoch: impl rtic::Mutex<T=Option<f64>>) -> Timestamp {
+        let ticks = monotonics::now().ticks() as f64 / TIME_GRANULARITY as f64;
+        if let Some(epoch) = epoch.lock(|v| *v) {
+            Timestamp::Abs(epoch + ticks)
+        } else {
+            Timestamp::Rel(ticks)
+        }
+    }
+
     /// SECoP request server task
-    #[task(shared = [w5500, node], capacity = 5)]
+    #[task(shared = [w5500, node, ntp_time], capacity = 5)]
     fn secop_request(mut cx: secop_request::Context, sn: Sn) {
+        let time = get_time(cx.shared.ntp_time);
+        // TODO: this doesn't consider fragmented requests
         cx.shared.w5500.lock(|w5500| {
             let mut msg_len = 0;
             let mut buf = [0; 1024];
@@ -325,27 +387,42 @@ mod app {
             if msg_len == 0 {
                 return;
             }
-            info!("[SECoP] incoming: {:?}", core::str::from_utf8(&buf[..msg_len]).map_err(|_| ()));
-            if let Ok(mut writer) = w5500.tcp_writer(sn) {
-                cx.shared.node.lock(|node| node.process(&buf[..msg_len], &mut writer));
-                writer.send().unwrap();
-            } else {
-                error!("[SECoP] failed to get writer");
-            }
+            info!("[SECoP] incoming: {:?}",
+                  core::str::from_utf8(&buf[..msg_len]).map_err(|_| ()));
+            cx.shared.node.lock(|node| node.process(
+                time, &buf[..msg_len], sn as usize,
+                |sn, callback: &dyn Fn(&mut dyn fmt::Write)| {
+                    if let Ok(writer) = w5500.tcp_writer(SOCKETS[sn]) {
+                        let mut wrap = WriterWrap(writer, PhantomData);
+                        callback(&mut wrap);
+                        wrap.0.send().unwrap();
+                    }
+                }
+            ));
         })
     }
 
     /// SECoP regular polling task
-    #[task(shared = [w5500, node], capacity = 5)]
-    fn secop_poll(cx: secop_poll::Context, sn: Sn) {
-        (cx.shared.w5500, cx.shared.node).lock(
-            |w5500, node| {
-                if let Ok(mut writer) = w5500.tcp_writer(sn) {
-                    node.poll(&mut writer);
-                    writer.send().unwrap();
+    #[task(shared = [w5500, node, ntp_time])]
+    fn secop_poll(cx: secop_poll::Context) {
+        let time = get_time(cx.shared.ntp_time);
+        (cx.shared.w5500, cx.shared.node).lock(|w5500, node| {
+            node.poll(time, |sn, callback: &dyn Fn(&mut dyn fmt::Write)| {
+                if let Ok(writer) = w5500.tcp_writer(SOCKETS[sn]) {
+                    let mut wrap = WriterWrap(writer, PhantomData);
+                    callback(&mut wrap);
+                    wrap.0.send().unwrap();
                 }
-            }
-        );
-        secop_poll::spawn_after(500.millis(), sn).unwrap();
+            });
+        });
+        secop_poll::spawn_after(500.millis()).unwrap();
+    }
+}
+
+struct WriterWrap<E, T: Write<E>>(T, PhantomData<E>);
+
+impl<E, T: Write<E>> fmt::Write for WriterWrap<E, T> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0.write(s.as_bytes()).map_err(|_| fmt::Error).map(|_| ())
     }
 }
