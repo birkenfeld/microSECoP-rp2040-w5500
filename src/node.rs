@@ -2,7 +2,6 @@ use embedded_hal::adc::OneShot;
 use rp_pico::hal::adc::{Adc, TempSense};
 
 use usecop::Result;
-use usecop::proto::{JsonNull, JsonStr, JsonTuple2};
 
 pub type SecNode = usecop::node::SecNode<MyModules, 6>;
 
@@ -50,11 +49,11 @@ impl Temp {
         Ok(27f64 - (vbe - 0.706) / 0.001721)
     }
 
-    fn read_status(&mut self) -> Result<JsonTuple2<i64, JsonStr>> {
-        Ok(JsonTuple2(100, JsonStr("all good, trust me")))
+    fn read_status(&mut self) -> Result<(i32, &str)> {
+        Ok((100, "all good, trust me"))
     }
 
-    fn do_buzz(&mut self, _arg: &str) -> Result<JsonNull> {
-        Ok(JsonNull)
+    fn do_buzz(&mut self, _arg: f64) -> Result<()> {
+        Ok(())
     }
 }
