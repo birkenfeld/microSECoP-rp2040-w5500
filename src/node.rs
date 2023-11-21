@@ -1,6 +1,5 @@
 use embedded_hal::adc::OneShot;
 use rp_pico::hal::adc::{Adc, TempSense};
-
 use usecop::Result;
 
 pub type SecNode = usecop::node::SecNode<MyModules, 6>;
@@ -16,6 +15,11 @@ pub struct MyModules {
     temp: Temp,
 }
 
+#[derive(Clone, Copy, usecop_derive::DataInfo)]
+enum TempStatus {
+    Idle = 100,
+}
+
 #[derive(usecop_derive::Module)]
 #[secop(interface = "Readable")]
 #[secop(description = "test")]
@@ -24,14 +28,8 @@ pub struct MyModules {
               datainfo(double(unit="degC"))))]
 #[secop(param(name = "status", doc = "status of readout",
               readonly = true,
-              datainfo(tuple(
-                  member(enum_(
-                      member(name="idle", value=100),
-                      member(name="busy", value=300),
-                      member(name="error", value=400),
-                  )),
-                  member(str(maxchars=8)),
-              ))))]
+              datainfo(tuple(member(rust="TempStatus"),
+                             member(str(maxchars=8))))))]
 #[secop(command(name = "buzz", doc = "buzz it!",
                 argtype(double(unit="Hz")),
                 restype(null())))]
@@ -49,8 +47,8 @@ impl Temp {
         Ok(27f64 - (vbe - 0.706) / 0.001721)
     }
 
-    fn read_status(&mut self) -> Result<(i32, &str)> {
-        Ok((100, "all good, trust me"))
+    fn read_status(&mut self) -> Result<(TempStatus, &str)> {
+        Ok((TempStatus::Idle, "all good, trust me"))
     }
 
     fn do_buzz(&mut self, _arg: f64) -> Result<()> {
