@@ -6,7 +6,8 @@ pub type SecNode = usecop::node::SecNode<MyModules, 6>;
 
 pub fn create(adc: Adc, sensor: TempSense) -> SecNode {
     SecNode::new("rpi", "RPi Pico W5500 demo", MyModules {
-        temp: Temp { adc, sensor, internals: Default::default() },
+        temp: Temp { adc, sensor, conversion: 0.001721,
+                     internals: Default::default() },
     })
 }
 
@@ -30,6 +31,9 @@ enum TempStatus {
               readonly = true,
               datainfo(tuple(member(rust="TempStatus"),
                              member(str(maxchars=8))))))]
+#[secop(param(name = "conversion", doc = "conversion factor",
+              readonly = false, generate_accessors = true,
+              datainfo(double())))]
 #[secop(command(name = "buzz", doc = "buzz it!",
                 argtype(double(unit="Hz")),
                 restype(null())))]
@@ -37,6 +41,7 @@ struct Temp {
     internals: usecop::node::ModuleInternals,
     adc: Adc,
     sensor: TempSense,
+    conversion: f64,
 }
 
 impl Temp {
@@ -44,7 +49,7 @@ impl Temp {
         let refv = 3.3;
         let adc_value: u16 = self.adc.read(&mut self.sensor).unwrap();
         let vbe: f64 = f64::from(adc_value) * refv / 4096.0;
-        Ok(27f64 - (vbe - 0.706) / 0.001721)
+        Ok(27f64 - (vbe - 0.706) / self.conversion)
     }
 
     fn read_status(&mut self) -> Result<(TempStatus, &str)> {
