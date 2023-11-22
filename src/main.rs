@@ -387,10 +387,10 @@ mod app {
             if msg_len == 0 {
                 return;
             }
-            info!("[SECoP] incoming: {:?}",
-                  core::str::from_utf8(&buf[..msg_len]).map_err(|_| ()));
+            // info!("[SECoP] incoming: {:?}",
+            //       core::str::from_utf8(&buf[..msg_len]).map_err(|_| ()));
             cx.shared.node.lock(|node| node.process(
-                time, &buf[..msg_len], sn as usize,
+                time, &mut buf[..msg_len], sn as usize,
                 |sn, callback: &dyn Fn(&mut dyn fmt::Write)| {
                     if let Ok(writer) = w5500.tcp_writer(SOCKETS[sn]) {
                         let mut wrap = WriterWrap(writer, PhantomData);
