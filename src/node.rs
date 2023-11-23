@@ -35,8 +35,8 @@ enum TempStatus {
               readonly = false, generate_accessors = true,
               datainfo(double())))]
 #[secop(command(name = "buzz", doc = "buzz it!",
-                argtype(double(unit="Hz")),
-                restype(null())))]
+                argument(str(maxchars=10)),
+                result(str(maxchars=10))))]
 struct Temp {
     internals: usecop::node::ModuleInternals,
     adc: Adc,
@@ -56,7 +56,8 @@ impl Temp {
         Ok((TempStatus::Idle, "all good, trust me"))
     }
 
-    fn do_buzz(&mut self, _arg: f64) -> Result<()> {
-        Ok(())
+    fn do_buzz<'a>(&mut self, arg: &'a mut str) -> Result<&'a str> {
+        defmt::info!("got buzzed: <{}>", arg);
+        Ok(arg)
     }
 }
