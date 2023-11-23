@@ -32,7 +32,7 @@ use w5500_dhcp::{
     },
     Client as DhcpClient,
 };
-use usecop::proto::Timestamp;
+use usecop::{ClientId, Timestamp};
 
 mod node;
 
@@ -283,11 +283,11 @@ mod app {
 
                     if sn_ir.discon_raised() {
                         info!("[SECoP] client disconnected");
-                        cx.shared.node.lock(|node| node.client_finished(sn as usize));
+                        cx.shared.node.lock(|node| node.client_finished(sn as ClientId));
                         w5500.tcp_listen(sn, SECOP_PORT).unwrap();
                     } else if sn_ir.con_raised() {
                         info!("[SECoP] client connected");
-                        cx.shared.node.lock(|node| node.client_connected(sn as usize));
+                        cx.shared.node.lock(|node| node.client_connected(sn as ClientId));
                     }
                     if sn_ir.recv_raised() {
                         if secop_request::spawn(sn).is_err() {
@@ -390,7 +390,7 @@ mod app {
             // info!("[SECoP] incoming: {:?}",
             //       core::str::from_utf8(&buf[..msg_len]).map_err(|_| ()));
             cx.shared.node.lock(|node| node.process(
-                time, &mut buf[..msg_len], sn as usize,
+                time, &mut buf[..msg_len], sn as ClientId,
                 |sn, callback: &dyn Fn(&mut dyn fmt::Write)| {
                     if let Ok(writer) = w5500.tcp_writer(SOCKETS[sn]) {
                         let mut wrap = WriterWrap(writer, PhantomData);
