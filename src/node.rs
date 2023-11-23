@@ -1,13 +1,13 @@
 use embedded_hal::adc::OneShot;
 use rp_pico::hal::adc::{Adc, TempSense};
-use usecop::Result;
+use usecop::{ModuleInternals, Result};
 
 pub type SecNode = usecop::node::SecNode<MyModules, 6>;
 
 pub fn create(adc: Adc, sensor: TempSense) -> SecNode {
     SecNode::new("rpi", "RPi Pico W5500 demo", MyModules {
         temp: Temp { adc, sensor, conversion: 0.001721,
-                     internals: Default::default() },
+                     internals: ModuleInternals::new("test", 5.0) },
     })
 }
 
@@ -23,7 +23,6 @@ enum TempStatus {
 
 #[derive(usecop_derive::Module)]
 #[secop(interface = "Readable")]
-#[secop(description = "test")]
 #[secop(param(name = "value", doc = "main value of the temperature",
               readonly = true,
               datainfo(double(unit="degC"))))]
@@ -38,7 +37,7 @@ enum TempStatus {
                 argument(str(maxchars=10)),
                 result(str(maxchars=10))))]
 struct Temp {
-    internals: usecop::node::ModuleInternals,
+    internals: ModuleInternals,
     adc: Adc,
     sensor: TempSense,
     conversion: f64,
@@ -48,8 +47,8 @@ impl Temp {
     fn read_value(&mut self) -> Result<f64> {
         let refv = 3.3;
         let adc_value: u16 = self.adc.read(&mut self.sensor).unwrap();
-        let vbe: f64 = f64::from(adc_value) * refv / 4096.0;
-        Ok(27f64 - (vbe - 0.706) / self.conversion)
+        let vbe = f64::from(adc_value) * refv / 4096.0;
+        Ok(27.0 - (vbe - 0.706) / self.conversion)
     }
 
     fn read_status(&mut self) -> Result<(TempStatus, &str)> {
