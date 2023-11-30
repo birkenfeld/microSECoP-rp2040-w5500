@@ -2,9 +2,9 @@ use embedded_hal::adc::OneShot;
 use rp_pico::hal::adc::{Adc, TempSense};
 use usecop::{ModuleInternals, Result};
 
-pub type SecNode = usecop::node::SecNode<MyModules, 6>;
+pub type SecNode<const N: usize> = usecop::node::SecNode<MyModules, N>;
 
-pub fn create(adc: Adc, sensor: TempSense) -> SecNode {
+pub fn create<const N: usize>(adc: Adc, sensor: TempSense) -> SecNode<N> {
     SecNode::new("rpi", "RPi Pico W5500 demo", MyModules {
         temp: Temp { adc, sensor, conversion: 0.001721,
                      internals: ModuleInternals::new("test", 5.0) },

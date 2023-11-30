@@ -8,7 +8,6 @@ use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
 
-use core::fmt;
 use core::marker::PhantomData;
 use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
 use embedded_hal::digital::v2::OutputPin;
@@ -39,7 +38,10 @@ mod node;
 /// External high-speed crystal on the Raspberry Pi Pico board is 12 MHz.
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
-const SECOP_SN: [Sn; 6] = [Sn::Sn0, Sn::Sn1, Sn::Sn2, Sn::Sn3, Sn::Sn4, Sn::Sn5];
+const N_CONN: usize = 6;
+const BUF_SIZE: usize = 1024;
+
+const SECOP_SN: [Sn; N_CONN] = [Sn::Sn0, Sn::Sn1, Sn::Sn2, Sn::Sn3, Sn::Sn4, Sn::Sn5];
 const DHCP_SN: Sn = Sn::Sn6;
 const NTP_SN: Sn = Sn::Sn7;
 const IRQ_MASK: SocketInterruptMask = SocketInterruptMask::ALL_MASKED
@@ -83,7 +85,7 @@ mod app {
     #[shared]
     struct Shared {
         w5500: MyW5500,
-        node: node::SecNode,
+        node: node::SecNode<N_CONN>,
         dhcp: DhcpClient<'static>,
         dhcp_spawn_at: Option<u32>,
         ntp_time: Option<f64>,
@@ -92,6 +94,8 @@ mod app {
     #[local]
     struct Local {
         irq_pin: Pin<Gpio14, FunctionSio<SioInput>, PullDown>,
+        buffer: [[u8; BUF_SIZE]; N_CONN],
+        filled: [usize; N_CONN],
     }
 
     #[init]
@@ -232,6 +236,8 @@ mod app {
             },
             Local {
                 irq_pin: w5500_int,
+                buffer: [[0; BUF_SIZE]; N_CONN],
+                filled: [0; N_CONN],
             },
             init::Monotonics(mono),
         )
@@ -371,27 +377,35 @@ mod app {
     }
 
     /// SECoP request server task
-    #[task(shared = [w5500, node, ntp_time], capacity = 5)]
+    #[task(shared = [w5500, node, ntp_time], local = [buffer, filled], capacity = 6)]
     fn secop_request(mut cx: secop_request::Context, sn: Sn) {
         let time = get_time(cx.shared.ntp_time);
         // TODO: this doesn't consider fragmented requests
         cx.shared.w5500.lock(|w5500| {
-            let mut msg_len = 0;
-            let mut buf = [0; 1024];
+            let mut n_recvd = 0;
+            let buf = &mut cx.local.buffer[sn as usize];
+            let filled = &mut cx.local.filled[sn as usize];
+
             if let Ok(mut reader) = w5500.tcp_reader(sn) {
-                msg_len = reader.read(&mut buf).unwrap_or(0) as usize;
+                n_recvd = reader.read(&mut buf[*filled..]).unwrap_or(0) as usize;
                 reader.done().unwrap();
             } else {
                 error!("[SECoP] failed to get reader");
             }
-            if msg_len == 0 {
+            if n_recvd == 0 {
                 return;
             }
-            // info!("[SECoP] incoming: {:?}",
-            //       core::str::from_utf8(&buf[..msg_len]).map_err(|_| ()));
-            cx.shared.node.lock(|node| node.process(
-                time, &mut buf[..msg_len], sn as ClientId,
-                |sn, callback: &dyn Fn(&mut dyn fmt::Write)| {
+            *filled += n_recvd;
+
+            if *filled == BUF_SIZE {
+                error!("[SECoP] buffer overflow");
+                w5500.tcp_disconnect(sn).unwrap();
+                return;
+            }
+
+            let result = cx.shared.node.lock(|node| node.process(
+                time, &mut buf[..*filled], sn as ClientId,
+                |sn, callback: &dyn Fn(&mut dyn usecop::io::Write)| {
                     if let Ok(writer) = w5500.tcp_writer(SOCKETS[sn]) {
                         let mut wrap = WriterWrap(writer, PhantomData);
                         callback(&mut wrap);
@@ -399,6 +413,21 @@ mod app {
                     }
                 }
             ));
+
+            match result {
+                Err(_) => {
+                    info!("[SECoP] error, disconnect");
+                    w5500.tcp_disconnect(sn).unwrap();
+                }
+                Ok(0) => {
+                    debug!("[SECoP] no data processed, wait for more");
+                }
+                Ok(n_processed) => {
+                    debug!("[SECoP] processed {} bytes", n_processed);
+                    buf.copy_within(n_processed.., 0);
+                    *filled -= n_processed;
+                }
+            }
         })
     }
 
@@ -407,7 +436,7 @@ mod app {
     fn secop_poll(cx: secop_poll::Context) {
         let time = get_time(cx.shared.ntp_time);
         (cx.shared.w5500, cx.shared.node).lock(|w5500, node| {
-            node.poll(time, |sn, callback: &dyn Fn(&mut dyn fmt::Write)| {
+            node.poll(time, |sn, callback: &dyn Fn(&mut dyn usecop::io::Write)| {
                 if let Ok(writer) = w5500.tcp_writer(SOCKETS[sn]) {
                     let mut wrap = WriterWrap(writer, PhantomData);
                     callback(&mut wrap);
@@ -421,8 +450,12 @@ mod app {
 
 struct WriterWrap<E, T: Write<E>>(T, PhantomData<E>);
 
-impl<E, T: Write<E>> fmt::Write for WriterWrap<E, T> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0.write(s.as_bytes()).map_err(|_| fmt::Error).map(|_| ())
+impl<E, T: Write<E>> usecop::io::Write for WriterWrap<E, T> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, usecop::io::Error> {
+        self.0.write(buf).map(|v| v as usize)
+                         .map_err(|_| usecop::io::Error::new(usecop::io::ErrorKind::Other, ""))
+    }
+    fn flush(&mut self) -> Result<(), usecop::io::Error> {
+        Ok(())
     }
 }
