@@ -8,7 +8,6 @@ use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
 
-use core::marker::PhantomData;
 use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
 use embedded_hal::digital::v2::OutputPin;
 use fugit::{ExtU64, RateExtU32};
@@ -23,8 +22,9 @@ use rp_pico::hal::{
 };
 use systick_monotonic::Systick;
 use w5500_dhcp::{
-    hl::{Hostname, Tcp, Udp, io::Read, io::Write},
+    hl::{Hostname, Tcp, Udp, io::Read},
     ll::{
+        SocketCommand,
         eh0::{reset, vdm_infallible_gpio::W5500, MODE as W5500_MODE},
         net::Eui48Addr, net::SocketAddrV4,
         LinkStatus, OperationMode, PhyCfg, Registers, Sn, SOCKETS, SocketInterruptMask,
@@ -251,14 +251,14 @@ mod app {
     }
 
     /// IRQ handler for the W5500, dispatching tasks by socket
-    #[task(binds = IO_IRQ_BANK0, local = [irq_pin], shared = [w5500, node])]
+    #[task(binds = IO_IRQ_BANK0, local = [irq_pin], shared = [w5500, node], priority = 3)]
     fn irq_bank0(mut cx: irq_bank0::Context) {
+        cx.local.irq_pin.clear_interrupt(Interrupt::EdgeLow);
+
         debug!("[W5500] got interrupt");
 
         cx.shared.w5500.lock(|w5500| {
             let sir: u8 = w5500.sir().unwrap();
-
-            cx.local.irq_pin.clear_interrupt(Interrupt::EdgeLow);
 
             // may occur when there are power supply issues
             if sir == 0 {
@@ -268,7 +268,7 @@ mod app {
 
             if sir & DHCP_SN.bitmask() != 0 {
                 let sn_ir = w5500.sn_ir(DHCP_SN).unwrap();
-                let _ = w5500.set_sn_ir(DHCP_SN, sn_ir);
+                w5500.set_sn_ir(DHCP_SN, sn_ir).unwrap();
                 if dhcp_client::spawn().is_err() {
                     error!("DHCP task already spawned")
                 }
@@ -276,7 +276,7 @@ mod app {
 
             if sir & NTP_SN.bitmask() != 0 {
                 let sn_ir = w5500.sn_ir(NTP_SN).unwrap();
-                let _ = w5500.set_sn_ir(NTP_SN, sn_ir);
+                w5500.set_sn_ir(NTP_SN, sn_ir).unwrap();
                 if ntp_client::spawn().is_err() {
                     error!("NTP task already spawned")
                 }
@@ -285,15 +285,17 @@ mod app {
             for sn in SECOP_SN {
                 if sir & sn.bitmask() != 0 {
                     let sn_ir = w5500.sn_ir(sn).unwrap();
-                    let _ = w5500.set_sn_ir(sn, sn_ir);
+                    w5500.set_sn_ir(sn, sn_ir).unwrap();
 
                     if sn_ir.discon_raised() {
                         info!("[SECoP] client disconnected");
                         cx.shared.node.lock(|node| node.client_finished(sn as ClientId));
                         w5500.tcp_listen(sn, SECOP_PORT).unwrap();
-                    } else if sn_ir.con_raised() {
+                    }
+                    if sn_ir.con_raised() {
                         info!("[SECoP] client connected");
                         cx.shared.node.lock(|node| node.client_connected(sn as ClientId));
+                        let _ = secop_request::spawn_after(100.millis(), sn);
                     }
                     if sn_ir.recv_raised() {
                         if secop_request::spawn(sn).is_err() {
@@ -380,22 +382,19 @@ mod app {
     #[task(shared = [w5500, node, ntp_time], local = [buffer, filled], capacity = 6)]
     fn secop_request(mut cx: secop_request::Context, sn: Sn) {
         let time = get_time(cx.shared.ntp_time);
-        // TODO: this doesn't consider fragmented requests
         cx.shared.w5500.lock(|w5500| {
-            let mut n_recvd = 0;
             let buf = &mut cx.local.buffer[sn as usize];
             let filled = &mut cx.local.filled[sn as usize];
 
-            if let Ok(mut reader) = w5500.tcp_reader(sn) {
-                n_recvd = reader.read(&mut buf[*filled..]).unwrap_or(0) as usize;
-                reader.done().unwrap();
-            } else {
-                error!("[SECoP] failed to get reader");
-            }
-            if n_recvd == 0 {
+            let Ok(mut reader) = w5500.tcp_reader(sn) else {
+                // Nothing to read, retry later
+                let _ = secop_request::spawn_after(100.millis(), sn);
                 return;
-            }
+            };
+            let n_recvd = reader.read(&mut buf[*filled..]).unwrap_or(0) as usize;
+            info!("[SECoP] read {} bytes", n_recvd);
             *filled += n_recvd;
+            reader.done().unwrap();
 
             if *filled == BUF_SIZE {
                 error!("[SECoP] buffer overflow");
@@ -406,11 +405,9 @@ mod app {
             let result = cx.shared.node.lock(|node| node.process(
                 time, &mut buf[..*filled], sn as ClientId,
                 |sn, callback: &dyn Fn(&mut dyn usecop::io::Write)| {
-                    if let Ok(writer) = w5500.tcp_writer(SOCKETS[sn]) {
-                        let mut wrap = WriterWrap(writer, PhantomData);
-                        callback(&mut wrap);
-                        wrap.0.send().unwrap();
-                    }
+                    let mut wrap = Writer::new(w5500, SOCKETS[sn]).unwrap();
+                    callback(&mut wrap);
+                    wrap.send().unwrap();
                 }
             ));
 
@@ -418,6 +415,7 @@ mod app {
                 Err(_) => {
                     info!("[SECoP] error, disconnect");
                     w5500.tcp_disconnect(sn).unwrap();
+                    return;
                 }
                 Ok(0) => {
                     debug!("[SECoP] no data processed, wait for more");
@@ -428,6 +426,8 @@ mod app {
                     *filled -= n_processed;
                 }
             }
+            // Try to read more later
+            let _ = secop_request::spawn_after(100.millis(), sn);
         })
     }
 
@@ -437,24 +437,67 @@ mod app {
         let time = get_time(cx.shared.ntp_time);
         (cx.shared.w5500, cx.shared.node).lock(|w5500, node| {
             node.poll(time, |sn, callback: &dyn Fn(&mut dyn usecop::io::Write)| {
-                if let Ok(writer) = w5500.tcp_writer(SOCKETS[sn]) {
-                    let mut wrap = WriterWrap(writer, PhantomData);
-                    callback(&mut wrap);
-                    wrap.0.send().unwrap();
-                }
+                let mut wrap = Writer::new(w5500, SOCKETS[sn]).unwrap();
+                callback(&mut wrap);
+                wrap.send().unwrap();
             });
         });
         secop_poll::spawn_after(500.millis()).unwrap();
     }
 }
 
-struct WriterWrap<E, T: Write<E>>(T, PhantomData<E>);
+// Mostly reimplemented from w5500's TcpWriter to send inbetween packets
+// if the buffer is full.
 
-impl<E, T: Write<E>> usecop::io::Write for WriterWrap<E, T> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, usecop::io::Error> {
-        self.0.write(buf).map(|v| v as usize)
-                         .map_err(|_| usecop::io::Error::new(usecop::io::ErrorKind::Other, ""))
+struct Writer<'w, W5500> {
+    w5500: &'w mut W5500,
+    sn: Sn,
+    tail_ptr: u16,
+    ptr: u16,
+}
+
+impl<'w, W5500: Registers> Writer<'w, W5500> {
+    fn new(w5500: &'w mut W5500, sn: Sn) -> Result<Self, W5500::Error> {
+        let tx_ptrs = w5500.sn_tx_ptrs(sn)?;
+        let ptr = tx_ptrs.wr;
+        let tail_ptr = tx_ptrs.wr.wrapping_add(tx_ptrs.fsr);
+        Ok(Self { w5500, sn, tail_ptr, ptr })
     }
+
+    fn remain(&self) -> u16 {
+        self.tail_ptr.wrapping_sub(self.ptr)
+    }
+
+    fn send(&mut self) -> Result<(), W5500::Error> {
+        self.w5500.set_sn_tx_wr(self.sn, self.ptr)?;
+        self.w5500.set_sn_cr(self.sn, SocketCommand::Send)?;
+        // Wait for send to complete. Hack, should use the interrupt instead...
+        loop {
+            let tx_ptrs = self.w5500.sn_tx_ptrs(self.sn)?;
+            if tx_ptrs.fsr != 0 {
+                self.ptr = tx_ptrs.wr;
+                self.tail_ptr = tx_ptrs.wr.wrapping_add(tx_ptrs.fsr);
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl<'w, W5500: Registers> usecop::io::Write for Writer<'w, W5500> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, usecop::io::Error> {
+        let write_size: u16 = self.remain().min(buf.len() as u16);
+        if write_size != 0 {
+            self.w5500
+                .set_sn_tx_buf(self.sn, self.ptr, &buf[..usize::from(write_size)])
+                .map_err(|_| usecop::io::Error::new(usecop::io::ErrorKind::BrokenPipe, ""))?;
+            self.ptr = self.ptr.wrapping_add(write_size);
+        }
+        if write_size < buf.len() as u16 {
+            self.send().map_err(|_| usecop::io::Error::new(usecop::io::ErrorKind::BrokenPipe, ""))?;
+        }
+        Ok(write_size as usize)
+    }
+
     fn flush(&mut self) -> Result<(), usecop::io::Error> {
         Ok(())
     }
