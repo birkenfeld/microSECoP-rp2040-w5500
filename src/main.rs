@@ -19,6 +19,7 @@ use rp_pico::hal::{
     pac::SPI1,
     spi::{Enabled, Spi},
     Clock,
+    multicore::{Multicore, Stack},
 };
 use systick_monotonic::Systick;
 use w5500_dhcp::{
@@ -65,6 +66,14 @@ fn monotonic_secs() -> u32 {
         .to_secs()
         .try_into()
         .unwrap()
+}
+
+static mut CORE1_STACK: Stack<4096> = Stack::new();
+
+fn core1_task() -> () {
+    loop {
+        cortex_m::asm::delay(10);
+    }
 }
 
 type MyW5500 = W5500<Spi<Enabled, SPI1, (Pin<Gpio11, FunctionSpi, PullDown>,
@@ -116,8 +125,14 @@ mod app {
         .unwrap();
 
         // Setup the pins.
-        let sio = hal::sio::Sio::new(dp.SIO);
+        let mut sio = hal::sio::Sio::new(dp.SIO);
         let pins = hal::gpio::Pins::new(dp.IO_BANK0, dp.PADS_BANK0, sio.gpio_bank0, &mut dp.RESETS);
+
+        // Other init code above this line
+        let mut mc = Multicore::new(&mut dp.PSM, &mut dp.PPB, &mut sio.fifo);
+        let cores = mc.cores();
+        let core1 = &mut cores[1];
+        let _test = core1.spawn(unsafe { &mut CORE1_STACK.mem }, core1_task);
 
         let systick = cx.core.SYST;
         let mut delay = cortex_m::delay::Delay::new(systick, clocks.system_clock.freq().to_Hz());
