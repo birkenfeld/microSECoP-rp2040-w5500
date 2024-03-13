@@ -5,9 +5,9 @@ use usecop::{ModuleInternals, Result};
 pub type SecNode<const N: usize> = usecop::node::SecNode<MyModules, N>;
 
 pub fn create<const N: usize>(adc: Adc, sensor: TempSense) -> SecNode<N> {
-    SecNode::new("rpi", "RPi Pico W5500 demo", MyModules {
+    SecNode::new("rpi", "microSECoP demo over RPi Pico + W5500", MyModules {
         temp: Temp { adc, sensor, conversion: 0.001721,
-                     internals: ModuleInternals::new("test", 5.0) },
+                     internals: ModuleInternals::new("chip temperature", 5.0) },
     })
 }
 
@@ -29,7 +29,7 @@ enum TempStatus {
 #[secop(param(name = "status", doc = "status of readout",
               readonly = true,
               datainfo(tuple(member(rust="TempStatus"),
-                             member(str(maxchars=8))))))]
+                             member(str(maxchars=18))))))]
 #[secop(param(name = "conversion", doc = "conversion factor",
               readonly = false, generate_accessors = true,
               datainfo(double())))]
