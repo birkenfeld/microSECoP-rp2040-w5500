@@ -23,10 +23,10 @@ fugit = "0.3.6"
 w5500-dhcp = { version = "0.6", features = ["eh0", "defmt"] }
 
 [dependencies.usecop]
-path = "usecop"
+git = "https://github.com/SampleEnvironment/microSECoP"
 
 [dependencies.usecop-derive]
-path = "usecop/derive"
+git = "https://github.com/SampleEnvironment/microSECoP"
 
 # cargo build/run
 [profile.dev]
