@@ -1,5 +1,7 @@
 # microSECoP demo with Raspberry Pi Pico and Wiznet W5500
 
+Using the https://github.com/SampleEnvironment/microSECoP library.
+
 ## How to set up the hardware
 
 * Connect a W5500 extension board to the RPi Pico. Pinout:
